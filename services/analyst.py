@@ -1,468 +1,373 @@
 import json
+import time
 from datetime import datetime
-from openai import OpenAI
-from core.database import get_connection
 from config.settings import settings
 
+# ---------------------------------------------------------------------------
+# DeepSeek API helper (using requests – no extra SDK needed)
+# ---------------------------------------------------------------------------
+try:
+    import requests as _requests
 
-def get_ai_client():
-    """Create DeepSeek API client."""
-    if not settings.DEEPSEEK_API_KEY:
-        print("[ERROR] DEEPSEEK_API_KEY not set in .env")
-        return None
+    def _deepseek_chat(messages, model="deepseek-chat", temperature=0.3, max_tokens=2048):
+        """Send a chat completion request to DeepSeek."""
+        api_key = settings.DEEPSEEK_API_KEY
+        if not api_key:
+            print("[ANALYST] DeepSeek API key not configured.")
+            return ""
 
-    return OpenAI(
-        api_key=settings.DEEPSEEK_API_KEY,
-        base_url=settings.DEEPSEEK_BASE_URL,
-    )
+        resp = _requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
 
+except ImportError:
+    _requests = None
 
-def get_latest_data():
-    """Pull latest data from all tables for AI analysis."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    data = {}
-
-    # Latest stock prices
-    cursor.execute("""
-        SELECT ticker, asset_type, price, change_pct, volume
-        FROM market_prices
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM market_prices)
-        ORDER BY ABS(change_pct) DESC
-        LIMIT 20
-    """)
-    data["top_movers_stocks"] = [dict(r) for r in cursor.fetchall()]
-
-    # Latest crypto
-    cursor.execute("""
-        SELECT pair, price, change_pct_24h, volume_24h, market_cap
-        FROM crypto_prices
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM crypto_prices)
-        ORDER BY ABS(change_pct_24h) DESC
-    """)
-    data["crypto"] = [dict(r) for r in cursor.fetchall()]
-
-    # Latest commodities
-    cursor.execute("""
-        SELECT name, ticker, price, change_pct
-        FROM commodity_prices
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM commodity_prices)
-    """)
-    data["commodities"] = [dict(r) for r in cursor.fetchall()]
-
-    # Latest macro
-    cursor.execute("""
-        SELECT series_name, value, date
-        FROM macro_data
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM macro_data)
-    """)
-    data["macro"] = [dict(r) for r in cursor.fetchall()]
-
-    # Latest Polymarket (top by volume)
-    cursor.execute("""
-        SELECT question, market_price, volume, liquidity
-        FROM polymarket_contracts
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM polymarket_contracts)
-        ORDER BY volume DESC
-        LIMIT 15
-    """)
-    data["polymarket"] = [dict(r) for r in cursor.fetchall()]
-
-    # Latest sentiment
-    cursor.execute("""
-        SELECT ticker, score, post_count, summary
-        FROM sentiment
-        WHERE fetched_at = (SELECT MAX(fetched_at) FROM sentiment)
-        ORDER BY post_count DESC
-    """)
-    data["sentiment"] = [dict(r) for r in cursor.fetchall()]
-
-    conn.close()
-    return data
+    def _deepseek_chat(*args, **kwargs):
+        print("[ANALYST] requests library not installed. Cannot call DeepSeek.")
+        return ""
 
 
-SYSTEM_PROMPT = """You are EdgeSignal AI — an elite market analyst monitoring stocks, crypto, commodities, prediction markets, and macro economics in real-time.
+# ---------------------------------------------------------------------------
+# Helper: get current market data snapshot
+# ---------------------------------------------------------------------------
+def _fetch_market_snapshot():
+    """
+    Fetch a quick snapshot of market conditions:
+    - S&P 500 / Nasdaq / Dow price & daily change
+    - VIX
+    - US 10Y yield
+    - Top active stock tickers
+    Returns a dict for the AI prompt.
+    """
+    snapshot = {
+        "timestamp": datetime.now().isoformat(),
+        "indices": {},
+        "top_movers_stocks": [],
+    }
 
-Your job is to analyze ALL the data provided and generate actionable trading signals.
+    # Use yfinance for quick index data (lightweight, no complex parsing)
+    try:
+        import yfinance as yf
 
-RULES:
-1. Only generate signals you have HIGH confidence in (70%+ conviction)
-2. Every signal must have: asset, direction (BUY/SELL/ALERT), confidence (0-100), and clear reasoning
-3. Look for CROSS-ASSET patterns (e.g., oil inventory drop → energy stocks, bond yields → tech stocks)
-4. Flag Polymarket contracts where the probability seems mispriced based on other data
-5. Factor in sentiment — extreme bullish/bearish sentiment often signals reversals
-6. Be specific — name exact tickers, price levels, and timeframes
-7. If nothing stands out, say so. Never force a signal.
-
-RESPOND IN THIS EXACT JSON FORMAT:
-{
-    "market_summary": "2-3 sentence overview of current market conditions",
-    "signals": [
-        {
-            "asset_type": "stock|crypto|commodity|polymarket|macro",
-            "ticker": "AAPL",
-            "signal_type": "BUY|SELL|ALERT|EDGE",
-            "confidence": 75,
-            "headline": "Short punchy headline",
-            "analysis": "Detailed reasoning with data points"
+        index_tickers = {
+            "S&P 500": "^GSPC",
+            "Nasdaq": "^IXIC",
+            "Dow Jones": "^DJI",
+            "VIX": "^VIX",
+            "10Y Yield": "^TNX",
         }
-    ],
-    "cross_asset_insights": "Any patterns connecting different markets",
-    "risk_warnings": "Key risks to watch"
-}
 
-Return ONLY valid JSON. No markdown, no backticks, no extra text."""
+        for name, symbol in index_tickers.items():
+            try:
+                t = yf.Ticker(symbol)
+                data = t.history(period="2d")
+                if len(data) >= 2:
+                    prev_close = float(data["Close"].iloc[-2])
+                    current = float(data["Close"].iloc[-1])
+                    change_pct = round(((current - prev_close) / prev_close) * 100, 2)
+                    snapshot["indices"][name] = {
+                        "price": round(current, 2),
+                        "change_pct": change_pct,
+                    }
+                elif len(data) == 1:
+                    snapshot["indices"][name] = {
+                        "price": round(float(data["Close"].iloc[-1]), 2),
+                        "change_pct": 0.0,
+                    }
+            except Exception:
+                continue
+
+        # Get a few active tickers (from config/assets if available)
+        try:
+            from config.assets import ALL_STOCK_TICKERS
+            snapshot["top_movers_stocks"] = list(ALL_STOCK_TICKERS[:15])
+        except ImportError:
+            snapshot["top_movers_stocks"] = [
+                "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+                "NVDA", "TSLA", "AMD", "INTC", "BA",
+            ]
+
+    except Exception as e:
+        print(f"[ANALYST] Market snapshot fetch error: {e}")
+
+    return snapshot
 
 
-def run_analysis():
-    """Run full AI analysis on latest market data."""
-    print(f"\n{'='*50}")
-    print(f"[ANALYST] Starting AI analysis — {datetime.now()}")
-    print(f"{'='*50}")
+# ---------------------------------------------------------------------------
+# Main: run_premarket_analysis()
+# ---------------------------------------------------------------------------
+def run_premarket_analysis(send_email=True, send_telegram=True):
+    """
+    Full pre-market analysis pipeline:
+    1. Fetch current market data snapshot
+    2. Run multi-timeframe technical scan on top movers
+    3. Feed MTF results + market data into DeepSeek AI
+    4. Parse and return signals/analysis
+    5. (Optional) Send results via email and Telegram
+    """
+    print(f"\n{'='*60}")
+    print(f"[ANALYST] Pre-Market Analysis — {datetime.now()}")
+    print(f"{'='*60}")
 
-    client = get_ai_client()
-    if not client:
-        return None
+    # ---- Step 1: Market snapshot ----
+    print("[ANALYST] Fetching market snapshot...")
+    current_data = _fetch_market_snapshot()
 
-    # Gather all latest data
-    print("[ANALYST] Pulling latest data from all sources...")
-    data = get_latest_data()
+    # ---- Step 2: Multi-Timeframe analysis ----
+    print("[ANALYST] Running MTF scan...")
+    mtf_data = []
+    try:
+        from services.multi_timeframe import run_multi_timeframe_scan, get_mtf_summary_for_ai
+        run_multi_timeframe_scan(tickers=current_data.get('top_movers_stocks', [])[:10])
+        mtf_data = get_mtf_summary_for_ai()
+    except Exception as e:
+        print(f"[ANALYST] MTF scan failed: {e}")
 
-    # Check we have data
-    total_points = sum(len(v) if isinstance(v, list) else 0 for v in data.values())
-    if total_points == 0:
-        print("[ERROR] No data in database. Run data fetchers first.")
-        return None
+    # ---- Step 3: Build AI prompt ----
+    market_json = json.dumps(current_data.get("indices", {}), indent=2)
+    mtf_json = json.dumps(mtf_data[:10], indent=2)
 
-    print(f"[ANALYST] Loaded {total_points} data points across {len(data)} categories.")
+    user_prompt = f"""You are an expert financial analyst AI for EdgeSignal. Analyze the market and generate trading signals.
 
-    # Build the prompt
-    user_prompt = f"""Analyze this real-time market data and generate trading signals.
+=== MARKET DATA ===
+{market_json}
 
-Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+=== MULTI-TIMEFRAME TECHNICAL ANALYSIS ===
+{mtf_json}
 
-=== TOP STOCK MOVERS ===
-{json.dumps(data['top_movers_stocks'], indent=2)}
+=== INSTRUCTIONS ===
+Based on the market data and multi-timeframe technical analysis above, provide:
+1. A concise market summary (2-3 sentences)
+2. Top 3-5 trading signals with:
+   - ticker
+   - signal_type (BUY / SELL / NEUTRAL)
+   - confidence (0-100)
+   - headline (short description)
+   - analysis (1-2 sentences explaining the reasoning)
+   - entry_price (approximate)
+   - stop_loss (approximate)
+   - take_profit (approximate)
+   - timeframe (e.g. "swing_2_5_days", "day_trade", "position_1_2_weeks")
+3. Cross-asset insights (any correlations or macro signals)
+4. Risk warnings (any concerns like FOMC, earnings, geopolitical)
 
-=== CRYPTO PRICES ===
-{json.dumps(data['crypto'], indent=2)}
+Return your response as valid JSON with this exact structure:
+{{
+  "market_summary": "...",
+  "signals": [
+    {{
+      "ticker": "...",
+      "signal_type": "BUY",
+      "confidence": 80,
+      "headline": "...",
+      "analysis": "...",
+      "entry_price": 0.0,
+      "stop_loss": 0.0,
+      "take_profit": 0.0,
+      "timeframe": "swing_2_5_days"
+    }}
+  ],
+  "cross_asset_insights": "...",
+  "risk_warnings": "..."
+}}"""
 
-=== COMMODITIES ===
-{json.dumps(data['commodities'], indent=2)}
+    system_prompt = "You are a professional quantitative financial analyst. Respond ONLY with valid JSON. No markdown fences, no commentary."
 
-=== MACRO ECONOMIC DATA ===
-{json.dumps(data['macro'], indent=2)}
-
-=== POLYMARKET PREDICTION MARKETS ===
-{json.dumps(data['polymarket'], indent=2)}
-
-=== NEWS SENTIMENT ===
-{json.dumps(data['sentiment'], indent=2)}
-
-Generate signals based on this data. Look for cross-asset patterns and mispriced Polymarket contracts."""
-
-    # Call DeepSeek
-    print("[ANALYST] Sending to DeepSeek for analysis...")
+    # ---- Step 4: Call DeepSeek ----
+    print("[ANALYST] Calling DeepSeek API...")
+    analysis_result = None
 
     try:
-        response = client.chat.completions.create(
-            model=settings.DEEPSEEK_MODEL,
+        raw_response = _deepseek_chat(
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            model="deepseek-chat",
             temperature=0.3,
-            max_tokens=3000,
+            max_tokens=2048,
         )
 
-        raw = response.choices[0].message.content.strip()
+        if raw_response:
+            # Try to parse the JSON response
+            # Strip markdown fences if present
+            cleaned = raw_response.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                # Remove first and last fence lines
+                cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            analysis_result = json.loads(cleaned)
+            print("[ANALYST] DeepSeek response parsed successfully.")
 
-        # Clean response — remove markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
+            # Print summary
+            print(f"\n  📊 Market: {analysis_result.get('market_summary', 'N/A')[:120]}...")
+            sigs = analysis_result.get("signals", [])
+            for s in sigs:
+                icon = "🟢" if s.get("signal_type") == "BUY" else "🔴" if s.get("signal_type") == "SELL" else "⚪"
+                print(f"  {icon} {s.get('ticker')}: {s.get('headline', '')} ({s.get('confidence', 0)}%)")
 
-        result = json.loads(raw)
+        else:
+            print("[ANALYST] Empty response from DeepSeek.")
+            analysis_result = {
+                "market_summary": "Analysis unavailable.",
+                "signals": [],
+                "cross_asset_insights": "",
+                "risk_warnings": "",
+            }
 
     except json.JSONDecodeError as e:
-        print(f"[ERROR] Failed to parse AI response as JSON: {e}")
-        print(f"[RAW RESPONSE] {raw[:500]}")
-        return None
+        print(f"[ANALYST] Failed to parse DeepSeek JSON: {e}")
+        print(f"  Raw: {raw_response[:500] if raw_response else 'None'}")
+        analysis_result = {
+            "market_summary": "AI parsing error.",
+            "signals": [],
+            "cross_asset_insights": "",
+            "risk_warnings": "",
+        }
     except Exception as e:
-        print(f"[ERROR] DeepSeek API call failed: {e}")
-        return None
+        print(f"[ANALYST] DeepSeek API error: {e}")
+        analysis_result = {
+            "market_summary": f"API error: {e}",
+            "signals": [],
+            "cross_asset_insights": "",
+            "risk_warnings": "",
+        }
 
-    # Display results
-    print(f"\n{'='*50}")
-    print(f"📊 MARKET SUMMARY")
-    print(f"{'='*50}")
-    print(result.get("market_summary", "No summary"))
+    # ---- Step 5: Save to database ----
+    _save_analysis_to_db(current_data, mtf_data, analysis_result)
 
-    signals = result.get("signals", [])
-    print(f"\n{'='*50}")
-    print(f"🚨 SIGNALS GENERATED: {len(signals)}")
-    print(f"{'='*50}")
+    # ---- Step 6: Deliver results ----
+    # Email
+    if send_email and analysis_result.get("signals"):
+        try:
+            from services.email_alerts import send_daily_briefing
+            sent = send_daily_briefing(analysis_result)
+            if sent:
+                print("[ANALYST] Daily briefing emailed.")
+        except Exception as e:
+            print(f"[ANALYST] Email delivery failed: {e}")
 
-    for i, sig in enumerate(signals, 1):
-        emoji = "🟢" if sig["signal_type"] == "BUY" else "🔴" if sig["signal_type"] == "SELL" else "🟡"
-        print(f"\n  {emoji} Signal #{i}: {sig['signal_type']} {sig['ticker']}")
-        print(f"     Asset: {sig['asset_type']}")
-        print(f"     Confidence: {sig['confidence']}%")
-        print(f"     {sig['headline']}")
-        print(f"     {sig['analysis'][:200]}...")
+    # Telegram
+    if send_telegram and analysis_result.get("signals"):
+        try:
+            _send_telegram_signals(analysis_result)
+        except Exception as e:
+            print(f"[ANALYST] Telegram delivery failed: {e}")
 
-    cross = result.get("cross_asset_insights", "")
-    if cross:
-        print(f"\n{'='*50}")
-        print(f"🔗 CROSS-ASSET INSIGHTS")
-        print(f"{'='*50}")
-        print(cross)
-
-    risks = result.get("risk_warnings", "")
-    if risks:
-        print(f"\n{'='*50}")
-        print(f"⚠️  RISK WARNINGS")
-        print(f"{'='*50}")
-        print(risks)
-
-    # Save signals to DB
-    save_signals(signals)
-
-    print(f"\n[ANALYST] Analysis complete — {len(signals)} signals saved.")
-    return result
+    print(f"[ANALYST] Pre-market analysis complete.")
+    return analysis_result
 
 
-def save_signals(signals):
-    """Save AI-generated signals to database."""
-    if not signals:
-        return
+# ---------------------------------------------------------------------------
+# Save analysis to SQLite
+# ---------------------------------------------------------------------------
+def _save_analysis_to_db(market_data, mtf_data, analysis_result):
+    try:
+        from core.database import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    for s in signals:
+        # Create tables if needed
         cursor.execute("""
-            INSERT INTO signals
-            (asset_type, ticker, signal_type, confidence, headline, analysis)
+            CREATE TABLE IF NOT EXISTS ai_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_snapshot TEXT,
+                mtf_data TEXT,
+                signals TEXT,
+                market_summary TEXT,
+                cross_asset_insights TEXT,
+                risk_warnings TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            INSERT INTO ai_analysis
+            (market_snapshot, mtf_data, signals, market_summary, cross_asset_insights, risk_warnings)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            s["asset_type"], s["ticker"], s["signal_type"],
-            s["confidence"], s["headline"], s["analysis"]
+            json.dumps(market_data.get("indices", {})),
+            json.dumps(mtf_data),
+            json.dumps(analysis_result.get("signals", [])),
+            analysis_result.get("market_summary", ""),
+            analysis_result.get("cross_asset_insights", ""),
+            analysis_result.get("risk_warnings", ""),
         ))
 
-    conn.commit()
-    conn.close()
-    print(f"  [DB] Saved {len(signals)} signals.")
-
-
-def get_previous_day_data():
-    """Pull previous trading day's data for comparison."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    data = {}
-
-    # Previous day stock prices
-    cursor.execute("""
-        SELECT ticker, asset_type, price, change_pct, volume
-        FROM market_prices
-        WHERE DATE(fetched_at) < DATE('now')
-        ORDER BY fetched_at DESC
-        LIMIT 50
-    """)
-    data["prev_stocks"] = [dict(r) for r in cursor.fetchall()]
-
-    # Previous day crypto
-    cursor.execute("""
-        SELECT pair, price, change_pct_24h, volume_24h
-        FROM crypto_prices
-        WHERE DATE(fetched_at) < DATE('now')
-        ORDER BY fetched_at DESC
-        LIMIT 15
-    """)
-    data["prev_crypto"] = [dict(r) for r in cursor.fetchall()]
-
-    # Previous day commodities
-    cursor.execute("""
-        SELECT name, ticker, price, change_pct
-        FROM commodity_prices
-        WHERE DATE(fetched_at) < DATE('now')
-        ORDER BY fetched_at DESC
-        LIMIT 10
-    """)
-    data["prev_commodities"] = [dict(r) for r in cursor.fetchall()]
-
-    # Historical signals and their performance
-    cursor.execute("""
-        SELECT ticker, signal_type, confidence, headline, created_at
-        FROM signals
-        WHERE created_at >= datetime('now', '-7 days')
-        ORDER BY created_at DESC
-        LIMIT 20
-    """)
-    data["recent_signals"] = [dict(r) for r in cursor.fetchall()]
-
-    conn.close()
-    return data
-
-
-PREMARKET_PROMPT = """You are EdgeSignal AI — an elite pre-market analyst. The stock market opens in {minutes_left} minutes.
-
-You are analyzing PREVIOUS DAY data combined with CURRENT pre-market data to generate the MOST ACCURATE opening signals possible.
-
-CRITICAL RULES:
-1. You MUST provide specific stock/asset names — no vague suggestions
-2. Every signal needs: exact ticker, BUY or SELL, entry price target, stop loss, take profit
-3. Confidence must be realistic — only mark 80%+ if multiple data points align
-4. Compare today's pre-market data with yesterday's close to find gaps and momentum
-5. Cross-reference: if crypto dumped overnight, tech stocks may open weak
-6. Check macro data: if yields spiked, growth stocks face pressure
-7. Polymarket probabilities can signal upcoming catalysts
-8. News sentiment confirms or contradicts the price action
-9. FOCUS ON ACTIONABLE TRADES — what to buy/sell at market open
-
-RESPOND IN THIS EXACT JSON FORMAT:
-{{
-    "market_summary": "3-4 sentence pre-market overview with key overnight developments",
-    "market_bias": "BULLISH|BEARISH|NEUTRAL",
-    "signals": [
-        {{
-            "asset_type": "stock|crypto|commodity|polymarket",
-            "ticker": "EXACT_TICKER",
-            "signal_type": "BUY|SELL",
-            "confidence": 85,
-            "entry_price": 150.00,
-            "stop_loss": 147.00,
-            "take_profit": 156.00,
-            "headline": "Short punchy headline",
-            "analysis": "Detailed reasoning: yesterday X closed at Y, pre-market showing Z, macro supports because...",
-            "timeframe": "intraday|swing_2_5_days|position_1_4_weeks",
-            "risk_reward_ratio": "1:2"
-        }}
-    ],
-    "cross_asset_insights": "Connections between different markets affecting today's open",
-    "key_levels": "Critical support/resistance levels to watch today",
-    "risk_warnings": "What could invalidate these signals"
-}}
-
-Return ONLY valid JSON. No markdown, no backticks."""
-
-
-def run_premarket_analysis(minute_number=1):
-    """Run pre-market analysis combining previous day + current data."""
-    print(f"\n[ANALYST] Running pre-market analysis (minute {minute_number}/15)...")
-
-    client = get_ai_client()
-    if not client:
-        return None
-
-    # Get current data
-    current_data = get_latest_data()
-
-    # Get previous day data for comparison
-    prev_data = get_previous_day_data()
-
-    total = sum(len(v) if isinstance(v, list) else 0 for v in current_data.values())
-    total += sum(len(v) if isinstance(v, list) else 0 for v in prev_data.values())
-
-    if total == 0:
-        print("[ERROR] No data available. Run data fetchers first.")
-        return None
-
-    print(f"[ANALYST] Loaded {total} data points (current + historical).")
-
-    minutes_left = 15 - minute_number
-
-    user_prompt = f"""PRE-MARKET ANALYSIS — Minute {minute_number}/15 — Market opens in {minutes_left} minutes.
-
-=== CURRENT PRE-MARKET DATA ===
-
-TOP STOCK MOVERS (current):
-{json.dumps(current_data.get('top_movers_stocks', []), indent=2)}
-
-CRYPTO (live):
-{json.dumps(current_data.get('crypto', []), indent=2)}
-
-COMMODITIES (live):
-{json.dumps(current_data.get('commodities', []), indent=2)}
-
-MACRO DATA:
-{json.dumps(current_data.get('macro', []), indent=2)}
-
-POLYMARKET:
-{json.dumps(current_data.get('polymarket', []), indent=2)}
-
-NEWS SENTIMENT:
-{json.dumps(current_data.get('sentiment', []), indent=2)}
-
-=== PREVIOUS DAY DATA (for comparison) ===
-
-PREVIOUS STOCKS:
-{json.dumps(prev_data.get('prev_stocks', [])[:20], indent=2)}
-
-PREVIOUS CRYPTO:
-{json.dumps(prev_data.get('prev_crypto', []), indent=2)}
-
-PREVIOUS COMMODITIES:
-{json.dumps(prev_data.get('prev_commodities', []), indent=2)}
-
-RECENT SIGNALS (last 7 days):
-{json.dumps(prev_data.get('recent_signals', []), indent=2)}
-
-Generate your most accurate pre-market signals. This is minute {minute_number} — be specific with entry, stop loss, and take profit levels."""
-
-    try:
-        response = client.chat.completions.create(
-            model=settings.DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": PREMARKET_PROMPT.format(minutes_left=minutes_left)},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            max_tokens=4000,
-        )
-
-        raw = response.choices[0].message.content.strip()
-
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-
-        result = json.loads(raw)
-
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parse failed: {e}")
-        print(f"[RAW] {raw[:500]}")
-        return None
+        conn.commit()
+        conn.close()
     except Exception as e:
-        print(f"[ERROR] DeepSeek failed: {e}")
-        return None
-
-    # Display
-    bias_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(result.get("market_bias", ""), "⚪")
-    print(f"\n{bias_icon} Market Bias: {result.get('market_bias', 'N/A')}")
-    print(f"📊 {result.get('market_summary', 'No summary')}")
-
-    signals = result.get("signals", [])
-    print(f"\n🚨 {len(signals)} signals generated:")
-
-    for s in signals:
-        icon = "🟢" if s["signal_type"] == "BUY" else "🔴"
-        print(f"  {icon} [{s['signal_type']}] {s['ticker']} @ ${s.get('entry_price', 'N/A')}")
-        print(f"     SL: ${s.get('stop_loss', 'N/A')} | TP: ${s.get('take_profit', 'N/A')} | Conf: {s['confidence']}%")
-        print(f"     {s.get('headline', '')}")
-
-    # Save signals
-    if signals:
-        save_signals(signals)
-
-    return result
+        print(f"[ANALYST] DB save error: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Telegram delivery
+# ---------------------------------------------------------------------------
+def _send_telegram_signals(analysis_result):
+    try:
+        from bot.telegram_bot import send_message
+
+        sigs = analysis_result.get("signals", [])
+        if not sigs:
+            return
+
+        # Send summary header
+        header = f"""📊 <b>EDGESIGNAL PRE-MARKET ANALYSIS</b>
+━━━━━━━━━━━━━━━━━━━━
+{analysis_result.get('market_summary', '')[:200]}
+"""
+
+        send_message(header)
+
+        # Send each signal
+        for s in sigs:
+            icon = "🟢" if s.get("signal_type") == "BUY" else "🔴" if s.get("signal_type") == "SELL" else "⚪"
+            xasset = s.get("asset_type", "stock")
+            msg = f"""{icon} <b>{s.get('signal_type', 'ALERT')} | {s.get('ticker', '')}</b> ({xasset})
+━━━━━━━━━━━━━━━━━━━━
+<b>{s.get('headline', '')}</b>
+
+{s.get('analysis', '')}
+
+📈 Entry: ${s.get('entry_price', 'N/A')}
+🛑 Stop: ${s.get('stop_loss', 'N/A')}
+🎯 Target: ${s.get('take_profit', 'N/A')}
+⏱ Timeframe: {s.get('timeframe', 'N/A')}
+📊 Confidence: {s.get('confidence', 0)}%
+
+#{s.get('ticker', '').replace(' ', '')} #EdgeSignal"""
+            send_message(msg)
+
+        # Send risk / cross-asset
+        if analysis_result.get("risk_warnings"):
+            send_message(f"⚠️ <b>RISK WARNINGS</b>\n{analysis_result['risk_warnings']}")
+
+        if analysis_result.get("cross_asset_insights"):
+            send_message(f"🔗 <b>CROSS-ASSET INSIGHTS</b>\n{analysis_result['cross_asset_insights']}")
+
+    except Exception as e:
+        print(f"[ANALYST] Telegram send error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Standalone test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    run_analysis()
+    result = run_premarket_analysis(send_email=False, send_telegram=False)
+    print("\n" + "=" * 60)
+    print(json.dumps(result, indent=2, default=str))
