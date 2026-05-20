@@ -180,6 +180,22 @@ def get_overview():
     }
 
 
+@app.get("/api/performance")
+def get_performance():
+    conn = get_db()
+    try:
+        trades = conn.execute("""
+            SELECT ticker, signal_type, entry_price, exit_price, pnl, pnl_pct, exit_reason, closed_at
+            FROM signal_performance
+            ORDER BY closed_at DESC
+        """).fetchall()
+        conn.close()
+        return [dict(r) for r in trades]
+    except Exception:
+        conn.close()
+        return []
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

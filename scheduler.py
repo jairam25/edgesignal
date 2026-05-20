@@ -69,6 +69,9 @@ def fetch_all_data():
     from services.portfolio import update_all_positions
     run_safe("Portfolio Update", update_all_positions)
 
+    from services.performance import check_stop_loss_take_profit
+    run_safe("SL/TP Check", check_stop_loss_take_profit)
+
     print(f"\n✅ All data sources refreshed.")
 
 
@@ -163,6 +166,9 @@ def send_daily_recap():
     from services.portfolio import send_portfolio_update, auto_close_stale_positions
     auto_close_stale_positions(max_days=5)
     send_portfolio_update()
+
+    from services.performance import send_performance_report
+    send_performance_report()
 
     send_message(msg)
     print("[SCHEDULER] Daily recap sent.")
@@ -276,4 +282,6 @@ def scheduler_loop():
 
 if __name__ == "__main__":
     init_db()
+    from services.performance import init_performance_table
+    init_performance_table()
     scheduler_loop()
