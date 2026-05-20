@@ -10,6 +10,7 @@ sqlalchemy
 aiosqlite
 apscheduler
 python-telegram-bot
+pytz
 pandas
 numpy
 python-dotenv
