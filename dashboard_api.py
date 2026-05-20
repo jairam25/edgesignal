@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import json
 import asyncio
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -310,6 +311,23 @@ def get_mtf(ticker: str):
         conn.close()
         return {"error": "MTF table not available yet"}
 
+
+
+def run_scheduler_background():
+    """Run the scheduler in a background thread."""
+    try:
+        from scheduler import scheduler_loop
+        from core.database import init_db
+        init_db()
+        scheduler_loop()
+    except Exception as e:
+        print(f"[SCHEDULER] Error: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    thread = threading.Thread(target=run_scheduler_background, daemon=True)
+    thread.start()
+    print("[APP] Scheduler started in background.")
 
 if __name__ == "__main__":
     import uvicorn
