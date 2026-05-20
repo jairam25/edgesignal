@@ -66,6 +66,9 @@ def fetch_all_data():
     run_safe("Polymarket", fetch_polymarket)
     run_safe("Sentiment", fetch_sentiment)
 
+    from services.portfolio import update_all_positions
+    run_safe("Portfolio Update", update_all_positions)
+
     print(f"\n✅ All data sources refreshed.")
 
 
@@ -85,6 +88,10 @@ def run_premarket_analysis(minute_number):
         if minute_number == 1:
             # First minute: send full briefing
             broadcast_analysis(result)
+            # Auto-create positions from signals
+            from services.portfolio import create_position_from_signal
+            for signal in result.get("signals", []):
+                create_position_from_signal(signal)
         elif result.get("signals"):
             # Subsequent minutes: only send if new/updated signals
             from bot.telegram_bot import format_signal, send_message
@@ -151,6 +158,11 @@ def send_daily_recap():
 
 🕐 {get_et_now().strftime('%Y-%m-%d %H:%M ET')}
 #EdgeSignal #DailyRecap"""
+
+    # Send portfolio update too
+    from services.portfolio import send_portfolio_update, auto_close_stale_positions
+    auto_close_stale_positions(max_days=5)
+    send_portfolio_update()
 
     send_message(msg)
     print("[SCHEDULER] Daily recap sent.")
