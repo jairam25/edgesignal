@@ -3,7 +3,7 @@ EdgeSignal Dashboard API with WebSocket streaming
 Run: uvicorn dashboard_api:app --reload --port 8000
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import json
@@ -309,6 +309,51 @@ def get_mtf(ticker: str):
     except Exception:
         conn.close()
         return {"error": "MTF table not available yet"}
+
+
+@app.post("/api/create-checkout")
+async def create_checkout(request: Request):
+    from services.payments import create_checkout_session
+    body = await request.json()
+    plan = body.get("plan", "pro")
+    email = body.get("email", "")
+    if not email:
+        return {"error": "Email required"}
+    result = create_checkout_session(
+        plan=plan,
+        email=email,
+        success_url="http://localhost:3000/success",
+        cancel_url="http://localhost:3000/pricing",
+    )
+    return result
+
+
+@app.post("/api/stripe-webhook")
+async def stripe_webhook(request: Request):
+    from services.payments import handle_webhook
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    result = handle_webhook(payload, sig)
+    return result
+
+
+@app.get("/api/subscriber-stats")
+def subscriber_stats():
+    from services.payments import get_subscriber_stats
+    return get_subscriber_stats()
+
+
+@app.get("/api/analyze-now")
+def analyze_now():
+    """Manually trigger AI analysis."""
+    try:
+        from services.analyst import run_premarket_analysis
+        result = run_premarket_analysis(send_email=False, send_telegram=False)
+        if result:
+            return {"status": "ok", "signals": len(result.get("signals", []))}
+        return {"status": "ok", "signals": 0, "message": "No signals generated"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 if __name__ == "__main__":
