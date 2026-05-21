@@ -352,6 +352,19 @@ def fetch_now():
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/api/analyze-now")
+def analyze_now():
+    """Manually trigger AI analysis."""
+    try:
+        from services.analyst import run_analysis
+        result = run_analysis()
+        if result:
+            return {"status": "ok", "signals": len(result.get("signals", []))}
+        return {"status": "ok", "signals": 0, "message": "No signals generated"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
