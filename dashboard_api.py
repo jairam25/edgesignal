@@ -329,6 +329,29 @@ async def startup_event():
     thread.start()
     print("[APP] Scheduler started in background.")
 
+@app.get("/api/fetch-now")
+def fetch_now():
+    """Manually trigger data fetch."""
+    try:
+        from services.market_data import fetch_all_market_data
+        from services.crypto_data import fetch_crypto
+        from services.commodity_data import fetch_commodities
+        from services.macro_data import fetch_macro
+        from services.polymarket import fetch_polymarket
+        from services.sentiment import fetch_sentiment
+        
+        fetch_all_market_data()
+        fetch_crypto()
+        fetch_commodities()
+        fetch_macro()
+        fetch_polymarket()
+        fetch_sentiment()
+        
+        return {"status": "ok", "message": "All data fetched"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
